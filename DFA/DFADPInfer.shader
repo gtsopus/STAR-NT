@@ -34,7 +34,7 @@
                 half4 frag(Varyings i) : SV_Target
                 {
                     uint fragmentCount = uint(round(SAMPLE_TEXTURE2D(_fragmentCount, sampler_PointClamp, i.texcoord).r));
-                    half4 bgColor = float4(1, 1, 1, 0);
+                    half4 bgColor = SAMPLE_TEXTURE2D(_BlitTexture, sampler_PointClamp, i.texcoord);
 
                     if (fragmentCount == 0) return bgColor;
 
