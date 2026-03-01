@@ -12,6 +12,7 @@
         Cull Off
         
         Pass
+        {
             Name "A-Buffer Clear"
             
             HLSLPROGRAM
