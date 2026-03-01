@@ -1,0 +1,403 @@
+﻿#pragma kernel EvaluateAndUpdate
+#pragma kernel EnforceNeighborConstraints
+#pragma kernel BuildCornerMask
+#pragma kernel ReduceComplexity
+
+// Precomputed tile node positions (k, m offsets within 16x16 tile)
+// 85 nodes: 1 root + 4 L2 + 16 L1 + 64 L0
+static const uint2 nodeOffsets[85] =
+{
+    uint2(0, 0),
+    uint2(0, 0), uint2(8, 0), uint2(0, 8), uint2(8, 8),
+    uint2(0, 0), uint2(4, 0), uint2(0, 4), uint2(4, 4),
+    uint2(8, 0), uint2(12, 0), uint2(8, 4), uint2(12, 4),
+    uint2(0, 8), uint2(4, 8), uint2(0, 12), uint2(4, 12),
+    uint2(8, 8), uint2(12, 8), uint2(8, 12), uint2(12, 12),
+    uint2(0, 0), uint2(2, 0), uint2(0, 2), uint2(2, 2),
+    uint2(4, 0), uint2(6, 0), uint2(4, 2), uint2(6, 2),
+    uint2(0, 4), uint2(2, 4), uint2(0, 6), uint2(2, 6),
+    uint2(4, 4), uint2(6, 4), uint2(4, 6), uint2(6, 6),
+    uint2(8, 0), uint2(10, 0), uint2(8, 2), uint2(10, 2),
+    uint2(12, 0), uint2(14, 0), uint2(12, 2), uint2(14, 2),
+    uint2(8, 4), uint2(10, 4), uint2(8, 6), uint2(10, 6),
+    uint2(12, 4), uint2(14, 4), uint2(12, 6), uint2(14, 6),
+    uint2(0, 8), uint2(2, 8), uint2(0, 10), uint2(2, 10),
+    uint2(4, 8), uint2(6, 8), uint2(4, 10), uint2(6, 10),
+    uint2(0, 12), uint2(2, 12), uint2(0, 14), uint2(2, 14),
+    uint2(4, 12), uint2(6, 12), uint2(4, 14), uint2(6, 14),
+    uint2(8, 8), uint2(10, 8), uint2(8, 10), uint2(10, 10),
+    uint2(12, 8), uint2(14, 8), uint2(12, 10), uint2(14, 10),
+    uint2(8, 12), uint2(10, 12), uint2(8, 14), uint2(10, 14),
+    uint2(12, 12), uint2(14, 12), uint2(12, 14), uint2(14, 14)
+};
+
+static const uint nodeSizes[4] = { 2, 4, 8, 16 };
+
+StructuredBuffer<uint3> TileMasks;
+RWStructuredBuffer<uint3> TileMasksRW;
+StructuredBuffer<uint3> TileMasksPrev;
+RWStructuredBuffer<uint3> TileMasksTemp;
+
+RWTexture2D<float> _CornerMask;
+Texture2D<float4> _CameraTexture;
+
+uint _ScreenWidth;
+uint _ScreenHeight;
+uint _TilesX;
+uint _TilesY;
+uint _EnableTemporalSmoothing;
+
+// ── ReduceComplexity output ───────────────────────────────────────────────────
+// 4-element uint buffer — one counter per tile level.
+//   [0] = occupied tiles at level 0  (root unsplit, but transparent — low variance flat)
+//   [1] = occupied tiles at level 1  (root split into 8x8 children)
+//   [2] = occupied tiles at level 2  (split to 4x4)
+//   [3] = occupied tiles at level 3  (split to 2x2 — highest complexity)
+//
+// CPU computes:
+//   total        = sum of all four counters
+//   weightedSum  = 0*n[0] + 1*n[1] + 2*n[2] + 3*n[3]
+//   weightedAvg  = weightedSum / max(1, total)
+//   avg > 2.0    → full res   (1.0)
+//   avg > 1.0    → half res   (0.5)
+//   else         → quarter res (0.25)
+//
+// Buffer must be zeroed by CPU before each dispatch.
+RWStructuredBuffer<uint> _ReductionResult;
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool GetBit(uint3 mask, uint bitIdx)
+{
+    if (bitIdx < 32)
+        return (mask.x & (1u << bitIdx)) != 0;
+    if (bitIdx < 64)
+        return (mask.y & (1u << (bitIdx - 32))) != 0;
+    return (mask.z & (1u << (bitIdx - 64))) != 0;
+}
+
+void SetBit(inout uint3 mask, uint bitIdx)
+{
+    if (bitIdx < 32)
+        mask.x |= (1u << bitIdx);
+    else if (bitIdx < 64)
+        mask.y |= (1u << (bitIdx - 32));
+    else
+        mask.z |= (1u << (bitIdx - 64));
+}
+
+uint GetMaxLevel(uint3 mask)
+{
+    [unroll]
+    for (uint i = 21; i < 85; i++)
+        if (GetBit(mask, i))
+            return 3;
+    [unroll]
+    for (uint i = 5; i < 21; i++)
+        if (GetBit(mask, i))
+            return 2;
+    if (GetBit(mask, 0))
+        return 1;
+    return 0;
+}
+
+uint3 ClampMaskToLevel(uint3 mask, uint targetLevel)
+{
+    uint3 clamped = uint3(0, 0, 0);
+    if (targetLevel == 0)
+        return clamped;
+    if (targetLevel >= 1)
+        SetBit(clamped, 0);
+    if (targetLevel >= 2)
+    {
+        bool any = false;
+        [unroll]
+        for (uint i = 1; i <= 4; i++)
+            if (GetBit(mask, i))
+            {
+                SetBit(clamped, i);
+                any = true;
+            }
+        if (!any)
+            SetBit(clamped, 1);
+    }
+    if (targetLevel >= 3)
+    {
+        bool any = false;
+        [unroll]
+        for (uint i = 5; i < 21; i++)
+            if (GetBit(mask, i))
+            {
+                SetBit(clamped, i);
+                any = true;
+            }
+        if (!any)
+            SetBit(clamped, 5);
+    }
+    return clamped;
+}
+
+float GetNodeVariance(uint tileX, uint tileY, uint nodeIdx)
+{
+    uint level = (nodeIdx >= 21) ? 0 : (nodeIdx >= 5) ? 1 : (nodeIdx >= 1) ? 2 : 3;
+    uint nodeSize = nodeSizes[level];
+    uint2 offset = nodeOffsets[nodeIdx];
+
+    uint px0 = tileX * 16 + offset.x;
+    uint py0 = tileY * 16 + offset.y;
+    uint px1 = min(px0 + nodeSize - 1, _ScreenWidth - 1);
+    uint py1 = min(py0 + nodeSize - 1, _ScreenHeight - 1);
+
+    float4 c0 = _CameraTexture[uint2(px0, py0)];
+    float4 c3 = _CameraTexture[uint2(px1, py1)];
+    if (length(c0 - c3) < 0.001)
+        return 0.0;
+
+    float4 c1 = _CameraTexture[uint2(px1, py0)];
+    float4 c2 = _CameraTexture[uint2(px0, py1)];
+
+    float d = length(c0 - c1) + length(c0 - c2) + length(c0 - c3)
+            + length(c1 - c2) + length(c1 - c3) + length(c2 - c3);
+    return d / 6.0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+[numthreads(8, 8, 1)]
+void EvaluateAndUpdate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TilesX || id.y >= _TilesY)
+        return;
+
+    uint tileIdx = id.y * _TilesX + id.x;
+    uint3 oldMask = TileMasks[tileIdx];
+    uint3 prevMask = TileMasksPrev[tileIdx];
+
+    float splitThresholds[4] = { 0.005, 0.0125, 0.020, 0.04 };
+    float mergeThresholds[4] = { 0.003, 0.0115, 0.018, 0.035 };
+
+    uint3 newMask = uint3(0, 0, 0);
+    float rootVar = GetNodeVariance(id.x, id.y, 0);
+
+    if (rootVar > splitThresholds[3])
+    {
+        SetBit(newMask, 0);
+        [unroll]
+        for (uint i = 1; i <= 4; i++)
+        {
+            float v2 = GetNodeVariance(id.x, id.y, i);
+            if (v2 > splitThresholds[2])
+            {
+                SetBit(newMask, i);
+                uint base = 5 + (i - 1) * 4;
+                [unroll]
+                for (uint j = 0; j < 4; j++)
+                {
+                    uint g = base + j;
+                    float v1 = GetNodeVariance(id.x, id.y, g);
+                    if (v1 > splitThresholds[1] || (v1 >= mergeThresholds[1] && GetBit(oldMask, g)))
+                        SetBit(newMask, g);
+                }
+            }
+            else if (v2 >= mergeThresholds[2] && GetBit(oldMask, i))
+            {
+                SetBit(newMask, i);
+                uint base = 5 + (i - 1) * 4;
+                [unroll]
+                for (uint j = 0; j < 4; j++)
+                {
+                    uint g = base + j;
+                    float v1 = GetNodeVariance(id.x, id.y, g);
+                    if (v1 > splitThresholds[1] || (v1 >= mergeThresholds[1] && GetBit(oldMask, g)))
+                        SetBit(newMask, g);
+                }
+            }
+        }
+    }
+    else if (rootVar >= mergeThresholds[3] && GetBit(oldMask, 0))
+    {
+        SetBit(newMask, 0);
+        [unroll]
+        for (uint i = 1; i <= 4; i++)
+        {
+            float v2 = GetNodeVariance(id.x, id.y, i);
+            if (v2 > splitThresholds[2])
+            {
+                SetBit(newMask, i);
+                uint base = 5 + (i - 1) * 4;
+                [unroll]
+                for (uint j = 0; j < 4; j++)
+                {
+                    uint g = base + j;
+                    float v1 = GetNodeVariance(id.x, id.y, g);
+                    if (v1 > splitThresholds[1] || (v1 >= mergeThresholds[1] && GetBit(oldMask, g)))
+                        SetBit(newMask, g);
+                }
+            }
+            else if (v2 >= mergeThresholds[2] && GetBit(oldMask, i))
+            {
+                SetBit(newMask, i);
+                uint base = 5 + (i - 1) * 4;
+                [unroll]
+                for (uint j = 0; j < 4; j++)
+                {
+                    uint g = base + j;
+                    if (GetBit(oldMask, g))
+                        SetBit(newMask, g);
+                }
+            }
+        }
+    }
+
+    if (_EnableTemporalSmoothing)
+    {
+        uint prevLevel = GetMaxLevel(prevMask);
+        uint desiredLevel = GetMaxLevel(newMask);
+        uint targetLevel = clamp(desiredLevel,
+                                  prevLevel > 0 ? prevLevel - 1 : 0,
+                                  min(prevLevel + 1, 3));
+        if (targetLevel != desiredLevel)
+            newMask = ClampMaskToLevel(newMask, targetLevel);
+    }
+
+    TileMasksRW[tileIdx] = newMask;
+}
+
+void ForceSplitToLevel(inout uint3 mask, uint target)
+{
+    if (target >= 1)
+        SetBit(mask, 0);
+    if (target >= 2)
+    {[unroll]
+        for (uint i = 1; i <= 4; i++)
+            SetBit(mask, i);
+    }
+    if (target >= 3)
+        SetBit(mask, 5);
+}
+
+[numthreads(8, 8, 1)]
+void EnforceNeighborConstraints(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TilesX || id.y >= _TilesY)
+        return;
+
+    uint tileIdx = id.y * _TilesX + id.x;
+    uint3 currentMask = TileMasksRW[tileIdx];
+    uint currentLevel = GetMaxLevel(currentMask);
+    uint maxNeighbor = 0;
+
+    if (id.x > 0)
+        maxNeighbor = max(maxNeighbor, GetMaxLevel(TileMasksRW[id.y * _TilesX + id.x - 1]));
+    if (id.x < _TilesX - 1)
+        maxNeighbor = max(maxNeighbor, GetMaxLevel(TileMasksRW[id.y * _TilesX + id.x + 1]));
+    if (id.y > 0)
+        maxNeighbor = max(maxNeighbor, GetMaxLevel(TileMasksRW[(id.y - 1) * _TilesX + id.x]));
+    if (id.y < _TilesY - 1)
+        maxNeighbor = max(maxNeighbor, GetMaxLevel(TileMasksRW[(id.y + 1) * _TilesX + id.x]));
+
+    if (maxNeighbor > currentLevel + 1)
+        ForceSplitToLevel(currentMask, maxNeighbor - 1);
+
+    TileMasksTemp[tileIdx] = currentMask;
+}
+
+[numthreads(8, 8, 1)]
+void BuildCornerMask(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TilesX || id.y >= _TilesY)
+        return;
+
+    uint tileIdx = id.y * _TilesX + id.x;
+    uint3 mask = TileMasks[tileIdx];
+    bool rootSplit = GetBit(mask, 0);
+
+    if (!rootSplit)
+    {
+        uint px0 = id.x * 16, py0 = id.y * 16;
+        uint px1 = min(px0 + 15, _ScreenWidth - 1);
+        uint py1 = min(py0 + 15, _ScreenHeight - 1);
+        _CornerMask[uint2(px0, py0)] = 1.0;
+        _CornerMask[uint2(px1, py0)] = 1.0;
+        _CornerMask[uint2(px0, py1)] = 1.0;
+        _CornerMask[uint2(px1, py1)] = 1.0;
+    }
+    else
+    {
+        [unroll]
+        for (uint i = 1; i <= 4; i++)
+        {
+            uint2 o2 = nodeOffsets[i];
+            if (!GetBit(mask, i))
+            {
+                uint px0 = id.x * 16 + o2.x, py0 = id.y * 16 + o2.y;
+                uint px1 = min(px0 + 7, _ScreenWidth - 1), py1 = min(py0 + 7, _ScreenHeight - 1);
+                _CornerMask[uint2(px0, py0)] = 0.75;
+                _CornerMask[uint2(px1, py0)] = 0.75;
+                _CornerMask[uint2(px0, py1)] = 0.75;
+                _CornerMask[uint2(px1, py1)] = 0.75;
+            }
+            else
+            {
+                uint base = 5 + (i - 1) * 4;
+                [unroll]
+                for (uint j = 0; j < 4; j++)
+                {
+                    uint g = base + j;
+                    uint2 o1 = nodeOffsets[g];
+                    if (!GetBit(mask, g))
+                    {
+                        uint px0 = id.x * 16 + o1.x, py0 = id.y * 16 + o1.y;
+                        uint px1 = min(px0 + 3, _ScreenWidth - 1), py1 = min(py0 + 3, _ScreenHeight - 1);
+                        _CornerMask[uint2(px0, py0)] = 0.5;
+                        _CornerMask[uint2(px1, py0)] = 0.5;
+                        _CornerMask[uint2(px0, py1)] = 0.5;
+                        _CornerMask[uint2(px1, py1)] = 0.5;
+                    }
+                    else
+                    {
+                        uint baseGG = 21 + (g - 5) * 4;
+                        [unroll]
+                        for (uint k = 0; k < 4; k++)
+                        {
+                            uint2 o0 = nodeOffsets[baseGG + k];
+                            uint px0 = id.x * 16 + o0.x, py0 = id.y * 16 + o0.y;
+                            uint px1 = min(px0 + 1, _ScreenWidth - 1), py1 = min(py0 + 1, _ScreenHeight - 1);
+                            _CornerMask[uint2(px0, py0)] = 0.25;
+                            _CornerMask[uint2(px1, py0)] = 0.25;
+                            _CornerMask[uint2(px0, py1)] = 0.25;
+                            _CornerMask[uint2(px1, py1)] = 0.25;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── ReduceComplexity ──────────────────────────────────────────────────────────
+// Buckets each occupied tile into _ReductionResult[level] via InterlockedAdd.
+// An "occupied" tile is one whose bitmask is non-zero (it has been split at
+// least once by EvaluateAndUpdate, meaning transparent content was detected).
+// Level-0 tiles with a zero mask are empty and are skipped.
+// _ReductionResult[0..3] must be zeroed by the CPU before dispatch.
+[numthreads(8, 8, 1)]
+void ReduceComplexity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TilesX || id.y >= _TilesY)
+        return;
+
+    uint tileIdx = id.y * _TilesX + id.x;
+    uint3 mask = TileMasks[tileIdx];
+
+    // Skip fully empty tiles — EvaluateAndUpdate leaves the mask all-zero
+    // when no transparency was detected (rootVar < mergeThreshold and no prior split).
+    bool anyBit = (mask.x | mask.y | mask.z) != 0u;
+    if (!anyBit)
+        return;
+
+    // GetMaxLevel returns 0 for an unsplit but occupied tile (root not split),
+    // 1 for root-split-only, 2 for 4x4, 3 for 2x2.
+    uint level = GetMaxLevel(mask);
+    InterlockedAdd(_ReductionResult[level], 1u);
+}

@@ -1,0 +1,90 @@
+﻿#pragma kernel InterpolateMask
+
+// Tile bitmasks - 3 uints per tile
+StructuredBuffer<uint3> TileMasks;
+
+Texture2D _CameraTexture;
+RWTexture2D<float4> _InterpolatedTexture;
+
+uint _ScreenWidth;
+uint _ScreenHeight;
+uint _TilesX;
+uint _TilesY;
+
+// Get bit from uint3 bitmask
+bool GetBit(uint3 mask, uint bitIdx)
+{
+    if (bitIdx < 32) return (mask.x & (1u << bitIdx)) != 0;
+    if (bitIdx < 64) return (mask.y & (1u << (bitIdx - 32))) != 0;
+    return (mask.z & (1u << (bitIdx - 64))) != 0;
+}
+
+uint GetActiveLevelFromOffset(uint3 mask, uint2 offset)
+{
+    if (!GetBit(mask, 0)) return 0;
+
+    uint cx = offset.x >> 3;
+    uint cy = offset.y >> 3;
+    uint cidx = 1 + cy * 2 + cx;
+    if (!GetBit(mask, cidx)) return 1;
+
+    cx = offset.x & 7;
+    cy = offset.y & 7;
+    uint gx = cx >> 2;
+    uint gy = cy >> 2;
+    uint gbase = 5 + (cidx - 1)*4;
+    uint gidx = gbase + gy*2 + gx;
+    if (!GetBit(mask, gidx)) return 2;
+    
+    return 3;
+}
+
+[numthreads(16, 16, 1)]
+void InterpolateMask(uint3 groupID : SV_GroupID, uint3 tid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID)
+{
+    if (groupID.x >= _TilesX || groupID.y >= _TilesY) return;
+    uint tileIdx = groupID.y * _TilesX + groupID.x;
+    
+    uint3 mask = TileMasks[tileIdx];
+    uint L = GetActiveLevelFromOffset(mask, tid.xy);
+    uint S = 16 >> L;
+    uint2 closestTileOffset = tid.xy/S * S;
+
+    uint2 ul = uint2(groupID.x*16, groupID.y*16) + closestTileOffset;
+    uint2 ll = ul + uint2(S - 1, 0);
+    uint2 ur = ul + uint2(0, S - 1);
+    uint2 lr = ul + uint2(S - 1, S - 1);
+    
+    uint2 pixel = dtid.xy;
+    if (pixel.x >= _ScreenWidth || pixel.y >= _ScreenHeight) return;
+
+    float4 color_ul = _CameraTexture[ul];
+    float4 color_ur = _CameraTexture[ur];
+    float4 color_ll = _CameraTexture[ll];
+    float4 color_lr = _CameraTexture[lr];
+
+    float2 d = float2(pixel) - float2(ul);
+    float2 uv = d/max(1.0, (float)(S-1));
+    uv = saturate(uv);
+    float4 top = lerp(color_ul, color_ll, uv.x);
+    float4 bottom = lerp(color_ur, color_lr, uv.x);
+    float4 color = lerp(top, bottom, uv.y);
+    //if (S == 16)
+    //{
+    //    color = float4(0.5, 0.95, 0.5, 1);
+    //}
+    //if (S == 8)
+    //{
+    //    color = float4(1, 1, 0, 1);
+    //}
+    //if (S == 4)
+    //{
+    //    color = float4(1, 0.0, 1, 1);
+    //}
+    //if (S == 2)
+    //{
+    //    color = float4(1, 0, 0, 1);
+    //}
+    
+    _InterpolatedTexture[pixel] = color;
+}
